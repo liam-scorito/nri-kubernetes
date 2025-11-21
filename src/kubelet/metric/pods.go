@@ -78,6 +78,49 @@ func (podsFetcher *PodsFetcher) DoPodsFetch() (definition.RawGroups, error) {
 	return podsFetcher.fillGaps(raw, pods), nil
 }
 
+// GetPodSpecs fetches and returns a map of pod specifications keyed by "namespace_podname".
+// This is used for volume filtering to determine volume types.
+func (podsFetcher *PodsFetcher) GetPodSpecs() (map[string]*v1.Pod, error) {
+	podsFetcher.logger.Debugf("Retrieving pod specifications for volume filtering")
+
+	r, err := podsFetcher.Fetch()
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		_ = r.Body.Close()
+	}()
+
+	if r.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("error calling kubelet %s path. Status code %d", KubeletPodsPath, r.StatusCode)
+	}
+
+	rawPods, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response from kubelet %s path. %s", KubeletPodsPath, err)
+	}
+
+	if len(rawPods) == 0 {
+		return nil, fmt.Errorf("error reading response from kubelet %s path. Response is empty", KubeletPodsPath)
+	}
+
+	var pods v1.PodList
+	err = json.Unmarshal(rawPods, &pods)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding response from kubelet %s path. %s", KubeletPodsPath, err)
+	}
+
+	podSpecs := make(map[string]*v1.Pod)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		podKey := fmt.Sprintf("%s_%s", pod.GetObjectMeta().GetNamespace(), pod.GetObjectMeta().GetName())
+		podSpecs[podKey] = pod
+	}
+
+	return podSpecs, nil
+}
+
 func (podsFetcher *PodsFetcher) fillGaps(raw definition.RawGroups, pods v1.PodList) definition.RawGroups { //nolint:gocyclo,cyclop
 	// If missing, we get the nodeIP from any other container in the node.
 	// Due to Kubelet "Wrong Pending status" bug. See https://github.com/kubernetes/kubernetes/pull/57106

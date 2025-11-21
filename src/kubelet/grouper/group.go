@@ -3,6 +3,7 @@ package grouper
 import (
 	"fmt"
 
+	"github.com/newrelic/nri-kubernetes/v3/internal/config"
 	"github.com/newrelic/nri-kubernetes/v3/internal/logutil"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
@@ -24,6 +25,8 @@ type Config struct {
 	Client                  client.HTTPGetter
 	Fetchers                []data.FetchFunc
 	DefaultNetworkInterface string
+	PodsFetcher             *metric.PodsFetcher
+	IntegrationConfig       *config.Config
 }
 
 type OptionFunc func(kc *grouper) error
@@ -87,7 +90,24 @@ func (r *grouper) Group(definition.SpecGroups) (definition.RawGroups, *data.Erro
 		}
 	}
 
-	resources, errs := metric.GroupStatsSummary(response)
+	// Get pod specs for volume filtering if PodsFetcher and config are available
+	var podSpecs map[string]*v1.Pod
+	if r.PodsFetcher != nil && r.IntegrationConfig != nil {
+		podSpecs, err = r.PodsFetcher.GetPodSpecs()
+		if err != nil {
+			r.logger.Warnf("Failed to get pod specs for volume filtering: %v", err)
+		}
+	}
+
+	// Use enhanced filtering with config if available
+	var resources definition.RawGroups
+	var errs []error
+	if r.IntegrationConfig != nil {
+		resources, errs = metric.GroupStatsSummaryWithConfig(response, podSpecs, &r.IntegrationConfig.Kubelet)
+	} else {
+		resources, errs = metric.GroupStatsSummary(response)
+	}
+
 	if len(errs) > 0 {
 		return nil, &data.ErrorGroup{
 			Recoverable: true,

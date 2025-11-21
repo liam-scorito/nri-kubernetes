@@ -90,15 +90,18 @@ func NewScraper(config *config.Config, providers Providers, options ...ScraperOp
 func (s *Scraper) Run(i *integration.Integration) error {
 	fetchAndFilterPrometheus := s.CAdvisor.MetricFamiliesGetFunc(kubeletMetric.KubeletCAdvisorMetricsPath)
 
+	podsFetcher := kubeletMetric.NewPodsFetcher(s.logger, s.Kubelet, s.config)
 	kubeletGrouper, err := grouper.New(
 		grouper.Config{
 			Client:     s.Kubelet,
 			NodeGetter: s.nodeGetter,
 			Fetchers: []data.FetchFunc{
-				kubeletMetric.NewPodsFetcher(s.logger, s.Kubelet, s.config).DoPodsFetch,
+				podsFetcher.DoPodsFetch,
 				kubeletMetric.CadvisorFetchFunc(fetchAndFilterPrometheus, metric.CadvisorQueries),
 			},
 			DefaultNetworkInterface: s.defaultNetworkInterface,
+			PodsFetcher:             podsFetcher,
+			IntegrationConfig:       s.config,
 		}, grouper.WithLogger(s.logger))
 	if err != nil {
 		return fmt.Errorf("creating Kubelet grouper: %w", err)

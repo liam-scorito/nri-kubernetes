@@ -153,6 +153,15 @@ type Kubelet struct {
 	// ScraperMaxReruns controls how many times the integration will attempt to
 	// run kubelet scraper when runtime error happens before giving up.
 	ScraperMaxReruns int `mapstructure:"scraperMaxReruns"`
+	// FilterServiceAccountVolumes filters out service account token volumes from volume metrics.
+	// When enabled, volumes with names starting with "kube-api-access-" will be excluded.
+	FilterServiceAccountVolumes bool `mapstructure:"filterServiceAccountVolumes"`
+	// FilterSecretVolumes filters out secret volumes from volume metrics.
+	// Requires cross-referencing with pod specs from /pods endpoint.
+	FilterSecretVolumes bool `mapstructure:"filterSecretVolumes"`
+	// FilterConfigMapVolumes filters out configmap volumes from volume metrics.
+	// Requires cross-referencing with pod specs from /pods endpoint.
+	FilterConfigMapVolumes bool `mapstructure:"filterConfigMapVolumes"`
 }
 
 // ControlPlane contains config options for the control plane scraper.

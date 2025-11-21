@@ -8,8 +8,11 @@ import (
 	"net/http"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	v1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 
+	"github.com/newrelic/nri-kubernetes/v3/internal/config"
 	"github.com/newrelic/nri-kubernetes/v3/src/client"
 	"github.com/newrelic/nri-kubernetes/v3/src/definition"
 )
@@ -193,10 +196,100 @@ func fetchVolumeStats(v v1.VolumeStats) (definition.RawMetrics, error) {
 	return r, nil
 }
 
+// shouldFilterVolume determines if a volume should be filtered out based on its name.
+// It filters service account token volumes (kube-api-access-*).
+func shouldFilterVolume(volumeName string) bool {
+	// Filter service account token volumes (projected volumes with kube-api-access prefix)
+	if strings.HasPrefix(volumeName, "kube-api-access-") {
+		return true
+	}
+	return false
+}
+
+// shouldFilterVolumeByType determines if a volume should be filtered based on its type in the pod spec.
+// It checks if the volume is a Secret, ConfigMap, or contains ServiceAccountToken sources.
+func shouldFilterVolumeByType(volumeName string, pod *corev1.Pod, cfg *config.Kubelet) bool {
+	if pod == nil {
+		log.Debugf("[VOLUME_FILTER] pod is nil for volume %s", volumeName)
+		return false
+	}
+
+	if cfg == nil {
+		log.Debugf("[VOLUME_FILTER] cfg is nil for volume %s", volumeName)
+		return false
+	}
+
+	// Find the volume spec in the pod
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name != volumeName {
+			continue
+		}
+
+		log.Debugf("[VOLUME_FILTER] Found volume %s in pod %s/%s", volumeName, pod.Namespace, pod.Name)
+
+		// Filter secrets
+		if cfg.FilterSecretVolumes && vol.Secret != nil {
+			log.Infof("[VOLUME_FILTER] Filtering SECRET volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+			return true
+		}
+
+		// Filter configmaps
+		if cfg.FilterConfigMapVolumes && vol.ConfigMap != nil {
+			log.Infof("[VOLUME_FILTER] Filtering CONFIGMAP volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+			return true
+		}
+
+		// Filter projected volumes containing service account tokens or configmaps
+		if vol.Projected != nil {
+			for _, source := range vol.Projected.Sources {
+				if cfg.FilterServiceAccountVolumes && source.ServiceAccountToken != nil {
+					log.Infof("[VOLUME_FILTER] Filtering SERVICEACCOUNT volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+					return true
+				}
+				if cfg.FilterConfigMapVolumes && source.ConfigMap != nil {
+					log.Infof("[VOLUME_FILTER] Filtering PROJECTED CONFIGMAP volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+					return true
+				}
+			}
+		}
+
+		log.Debugf("[VOLUME_FILTER] NOT filtering volume: %s (type not matched)", volumeName)
+		break
+	}
+
+	log.Warnf("[VOLUME_FILTER] Volume %s not found in pod spec", volumeName)
+	return false
+}
+
 // GroupStatsSummary groups specific data for pods, containers and node
 func GroupStatsSummary(statsSummary *v1.Summary) (definition.RawGroups, []error) {
+	return GroupStatsSummaryWithConfig(statsSummary, nil, nil)
+}
+
+// GroupStatsSummaryWithConfig groups specific data for pods, containers and node with optional filtering.
+// If podSpecs and config are provided, it will filter volumes based on their type (Secret, ConfigMap, ServiceAccountToken).
+func GroupStatsSummaryWithConfig(statsSummary *v1.Summary, podSpecs map[string]*corev1.Pod, cfg *config.Kubelet) (definition.RawGroups, []error) {
 	if statsSummary == nil {
 		return nil, []error{fmt.Errorf("got nil stats summary")}
+	}
+
+	log.Infof("[VOLUME_FILTER] Starting with config: FilterServiceAccount=%v, FilterSecret=%v, FilterConfigMap=%v",
+		cfg != nil && cfg.FilterServiceAccountVolumes,
+		cfg != nil && cfg.FilterSecretVolumes,
+		cfg != nil && cfg.FilterConfigMapVolumes)
+
+	if podSpecs == nil {
+		log.Warn("[VOLUME_FILTER] podSpecs is NIL - type-based filtering will NOT work!")
+	} else {
+		log.Infof("[VOLUME_FILTER] Loaded %d pod specs", len(podSpecs))
+		// Log the first few pod keys
+		count := 0
+		for key := range podSpecs {
+			if count < 3 {
+				log.Debugf("[VOLUME_FILTER] Sample pod key: %s", key)
+				count++
+			}
+		}
 	}
 
 	var errs []error
@@ -229,6 +322,22 @@ func GroupStatsSummary(statsSummary *v1.Summary) (definition.RawGroups, []error)
 
 		g["pod"][rawEntityID] = rawPodMetrics
 		for _, volume := range pod.VolumeStats {
+			log.Debugf("[VOLUME_FILTER] Processing volume %s from pod %s", volume.Name, rawEntityID)
+
+			// Skip filtered volumes (secrets, configmaps, service account tokens)
+			// First check simple name-based filtering (always enabled for service account tokens)
+			if shouldFilterVolume(volume.Name) {
+				continue
+			}
+
+			// If config and pod specs are available, do type-based filtering
+			if cfg != nil && podSpecs != nil {
+				podSpec := podSpecs[rawEntityID]
+				if shouldFilterVolumeByType(volume.Name, podSpec, cfg) {
+					continue
+				}
+			}
+
 			rawVolumeMetrics, err := fetchVolumeStats(volume)
 			if err != nil {
 				errs = append(errs, err)
@@ -236,8 +345,8 @@ func GroupStatsSummary(statsSummary *v1.Summary) (definition.RawGroups, []error)
 			}
 			rawVolumeMetrics["podName"] = rawPodMetrics["podName"]
 			rawVolumeMetrics["namespace"] = rawPodMetrics["namespace"]
-			rawEntityID = fmt.Sprintf("%s_%s_%s", rawPodMetrics["namespace"], rawPodMetrics["podName"], rawVolumeMetrics["volumeName"])
-			g["volume"][rawEntityID] = rawVolumeMetrics
+			volumeEntityID := fmt.Sprintf("%s_%s_%s", rawPodMetrics["namespace"], rawPodMetrics["podName"], rawVolumeMetrics["volumeName"])
+			g["volume"][volumeEntityID] = rawVolumeMetrics
 		}
 
 		for _, container := range pod.Containers {
@@ -249,9 +358,9 @@ func GroupStatsSummary(statsSummary *v1.Summary) (definition.RawGroups, []error)
 			rawContainerMetrics["podName"] = rawPodMetrics["podName"]
 			rawContainerMetrics["namespace"] = rawPodMetrics["namespace"]
 
-			rawEntityID = fmt.Sprintf("%s_%s_%s", rawPodMetrics["namespace"], rawPodMetrics["podName"], rawContainerMetrics["containerName"])
+			containerEntityID := fmt.Sprintf("%s_%s_%s", rawPodMetrics["namespace"], rawPodMetrics["podName"], rawContainerMetrics["containerName"])
 
-			g["container"][rawEntityID] = rawContainerMetrics
+			g["container"][containerEntityID] = rawContainerMetrics
 		}
 	}
 

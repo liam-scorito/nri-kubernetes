@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +17,9 @@ import (
 	"github.com/newrelic/nri-kubernetes/v3/src/client"
 	"github.com/newrelic/nri-kubernetes/v3/src/definition"
 )
+
+// logConfigOnce ensures we only log the volume filtering configuration once
+var logConfigOnce sync.Once
 
 // StatsSummaryPath is the path where kubelet serves a summary with several information.
 const StatsSummaryPath = "/stats/summary"
@@ -206,6 +210,88 @@ func shouldFilterVolume(volumeName string) bool {
 	return false
 }
 
+// getAzureVolumeIdentifier extracts a unique identifier for Azure volumes.
+// Returns an empty string if the volume is not an Azure volume.
+// For AzureFile: returns "azurefile:{namespace}:{secretName}:{shareName}"
+// For AzureDisk: returns "azuredisk:name:{diskName}" or "azuredisk:uri:{dataDiskURI}"
+func getAzureVolumeIdentifier(volumeName string, pod *corev1.Pod) string {
+	if pod == nil {
+		return ""
+	}
+
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name != volumeName {
+			continue
+		}
+
+		// Check for AzureFile
+		if vol.AzureFile != nil {
+			// Unique identifier: namespace + secretName + shareName
+			// This combination uniquely identifies an Azure File share
+			identifier := fmt.Sprintf("azurefile:%s:%s:%s",
+				pod.Namespace,
+				vol.AzureFile.SecretName,
+				vol.AzureFile.ShareName)
+			return identifier
+		}
+
+		// Check for AzureDisk
+		if vol.AzureDisk != nil {
+			// Unique identifier: diskName or diskURI
+			if vol.AzureDisk.DiskName != "" {
+				return fmt.Sprintf("azuredisk:name:%s", vol.AzureDisk.DiskName)
+			}
+			if vol.AzureDisk.DataDiskURI != "" {
+				return fmt.Sprintf("azuredisk:uri:%s", vol.AzureDisk.DataDiskURI)
+			}
+		}
+
+		// Not an Azure volume
+		return ""
+	}
+
+	return ""
+}
+
+// enrichAzureVolumeMetrics adds Azure-specific metadata to volume metrics.
+// This provides additional context about the Azure volume being reported.
+func enrichAzureVolumeMetrics(rawVolumeMetrics definition.RawMetrics, volumeName string, pod *corev1.Pod) {
+	if pod == nil {
+		return
+	}
+
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name != volumeName {
+			continue
+		}
+
+		if vol.AzureFile != nil {
+			rawVolumeMetrics["azureVolumeType"] = "azureFile"
+			rawVolumeMetrics["azureShareName"] = vol.AzureFile.ShareName
+			rawVolumeMetrics["azureSecretName"] = vol.AzureFile.SecretName
+			rawVolumeMetrics["azureReadOnly"] = vol.AzureFile.ReadOnly
+		}
+
+		if vol.AzureDisk != nil {
+			rawVolumeMetrics["azureVolumeType"] = "azureDisk"
+			if vol.AzureDisk.DiskName != "" {
+				rawVolumeMetrics["azureDiskName"] = vol.AzureDisk.DiskName
+			}
+			if vol.AzureDisk.DataDiskURI != "" {
+				rawVolumeMetrics["azureDiskURI"] = vol.AzureDisk.DataDiskURI
+			}
+			if vol.AzureDisk.FSType != nil {
+				rawVolumeMetrics["azureFSType"] = *vol.AzureDisk.FSType
+			}
+			if vol.AzureDisk.ReadOnly != nil {
+				rawVolumeMetrics["azureReadOnly"] = *vol.AzureDisk.ReadOnly
+			}
+		}
+
+		break
+	}
+}
+
 // shouldFilterVolumeByType determines if a volume should be filtered based on its type in the pod spec.
 // It checks if the volume is a Secret, ConfigMap, or contains ServiceAccountToken sources.
 func shouldFilterVolumeByType(volumeName string, pod *corev1.Pod, cfg *config.Kubelet) bool {
@@ -229,13 +315,13 @@ func shouldFilterVolumeByType(volumeName string, pod *corev1.Pod, cfg *config.Ku
 
 		// Filter secrets
 		if cfg.FilterSecretVolumes && vol.Secret != nil {
-			log.Infof("[VOLUME_FILTER] Filtering SECRET volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+			log.Debugf("[VOLUME_FILTER] Filtering SECRET volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
 			return true
 		}
 
 		// Filter configmaps
 		if cfg.FilterConfigMapVolumes && vol.ConfigMap != nil {
-			log.Infof("[VOLUME_FILTER] Filtering CONFIGMAP volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+			log.Debugf("[VOLUME_FILTER] Filtering CONFIGMAP volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
 			return true
 		}
 
@@ -243,18 +329,19 @@ func shouldFilterVolumeByType(volumeName string, pod *corev1.Pod, cfg *config.Ku
 		if vol.Projected != nil {
 			for _, source := range vol.Projected.Sources {
 				if cfg.FilterServiceAccountVolumes && source.ServiceAccountToken != nil {
-					log.Infof("[VOLUME_FILTER] Filtering SERVICEACCOUNT volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+					log.Debugf("[VOLUME_FILTER] Filtering SERVICEACCOUNT volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
 					return true
 				}
 				if cfg.FilterConfigMapVolumes && source.ConfigMap != nil {
-					log.Infof("[VOLUME_FILTER] Filtering PROJECTED CONFIGMAP volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
+					log.Debugf("[VOLUME_FILTER] Filtering PROJECTED CONFIGMAP volume: %s from pod %s/%s", volumeName, pod.Namespace, pod.Name)
 					return true
 				}
 			}
 		}
 
+		// Volume was found but didn't match any filter criteria, so don't filter it
 		log.Debugf("[VOLUME_FILTER] NOT filtering volume: %s (type not matched)", volumeName)
-		break
+		return false
 	}
 
 	log.Warnf("[VOLUME_FILTER] Volume %s not found in pod spec", volumeName)
@@ -273,24 +360,23 @@ func GroupStatsSummaryWithConfig(statsSummary *v1.Summary, podSpecs map[string]*
 		return nil, []error{fmt.Errorf("got nil stats summary")}
 	}
 
-	log.Infof("[VOLUME_FILTER] Starting with config: FilterServiceAccount=%v, FilterSecret=%v, FilterConfigMap=%v",
-		cfg != nil && cfg.FilterServiceAccountVolumes,
-		cfg != nil && cfg.FilterSecretVolumes,
-		cfg != nil && cfg.FilterConfigMapVolumes)
+	// Log configuration only once on first scrape
+	logConfigOnce.Do(func() {
+		log.Infof("[VOLUME_FILTER] Starting with config: FilterServiceAccount=%v, FilterSecret=%v, FilterConfigMap=%v, DeduplicateAzure=%v",
+			cfg != nil && cfg.FilterServiceAccountVolumes,
+			cfg != nil && cfg.FilterSecretVolumes,
+			cfg != nil && cfg.FilterConfigMapVolumes,
+			cfg != nil && cfg.DeduplicateAzureVolumes)
 
-	if podSpecs == nil {
-		log.Warn("[VOLUME_FILTER] podSpecs is NIL - type-based filtering will NOT work!")
-	} else {
-		log.Infof("[VOLUME_FILTER] Loaded %d pod specs", len(podSpecs))
-		// Log the first few pod keys
-		count := 0
-		for key := range podSpecs {
-			if count < 3 {
-				log.Debugf("[VOLUME_FILTER] Sample pod key: %s", key)
-				count++
-			}
+		if podSpecs == nil {
+			log.Warn("[VOLUME_FILTER] podSpecs is NIL - type-based filtering will NOT work!")
+		} else {
+			log.Infof("[VOLUME_FILTER] Loaded %d pod specs on first scrape", len(podSpecs))
 		}
-	}
+	})
+
+	// Track Azure volumes we've already reported in this scrape cycle
+	seenAzureVolumes := make(map[string]string) // map[azureVolumeID]firstPodEntityID
 
 	var errs []error
 	var rawEntityID string
@@ -338,11 +424,37 @@ func GroupStatsSummaryWithConfig(statsSummary *v1.Summary, podSpecs map[string]*
 				}
 			}
 
+			// Azure volume deduplication
+			if cfg != nil && cfg.DeduplicateAzureVolumes && podSpecs != nil {
+				podSpec := podSpecs[rawEntityID]
+				azureVolumeID := getAzureVolumeIdentifier(volume.Name, podSpec)
+
+				if azureVolumeID != "" {
+					// This is an Azure volume - check if we've already reported it
+					if firstPod, alreadySeen := seenAzureVolumes[azureVolumeID]; alreadySeen {
+						log.Debugf("[AZURE_DEDUP] Skipping duplicate Azure volume %s (already reported from pod %s, current pod %s)",
+							azureVolumeID, firstPod, rawEntityID)
+						continue
+					}
+
+					// First time seeing this Azure volume - mark it and continue processing
+					seenAzureVolumes[azureVolumeID] = rawEntityID
+					log.Debugf("[AZURE_DEDUP] Reporting Azure volume %s for the first time from pod %s",
+						azureVolumeID, rawEntityID)
+				}
+			}
+
 			rawVolumeMetrics, err := fetchVolumeStats(volume)
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
+
+			// Add Azure metadata if it's an Azure volume being reported
+			if cfg != nil && cfg.DeduplicateAzureVolumes && podSpecs != nil {
+				enrichAzureVolumeMetrics(rawVolumeMetrics, volume.Name, podSpecs[rawEntityID])
+			}
+
 			rawVolumeMetrics["podName"] = rawPodMetrics["podName"]
 			rawVolumeMetrics["namespace"] = rawPodMetrics["namespace"]
 			volumeEntityID := fmt.Sprintf("%s_%s_%s", rawPodMetrics["namespace"], rawPodMetrics["podName"], rawVolumeMetrics["volumeName"])
@@ -361,6 +473,14 @@ func GroupStatsSummaryWithConfig(statsSummary *v1.Summary, podSpecs map[string]*
 			containerEntityID := fmt.Sprintf("%s_%s_%s", rawPodMetrics["namespace"], rawPodMetrics["podName"], rawContainerMetrics["containerName"])
 
 			g["container"][containerEntityID] = rawContainerMetrics
+		}
+	}
+
+	// Log deduplication summary at debug level
+	if cfg != nil && cfg.DeduplicateAzureVolumes && len(seenAzureVolumes) > 0 {
+		log.Debugf("[AZURE_DEDUP] Summary: reported %d unique Azure volumes", len(seenAzureVolumes))
+		for azureID, podID := range seenAzureVolumes {
+			log.Debugf("[AZURE_DEDUP] %s -> %s", azureID, podID)
 		}
 	}
 

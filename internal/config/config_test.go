@@ -110,3 +110,30 @@ func TestEnableResourceQuotaSamples(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, cfg.EnableResourceQuotaSamples)
 }
+
+func TestDeduplicateAzureVolumes(t *testing.T) {
+	t.Run("loads_from_config_file", func(t *testing.T) {
+		cfg, err := config.LoadConfig(fakeDataDir, workingData)
+		require.NoError(t, err)
+		require.True(t, cfg.DeduplicateAzureVolumes, "deduplicateAzureVolumes should be true from config file")
+	})
+
+	t.Run("loads_from_env_variable", func(t *testing.T) {
+		const envKey = "NRI_KUBERNETES_KUBELET_DEDUPLICATEAZUREVOLUMES"
+		originalValue, wasSet := os.LookupEnv(envKey)
+		defer func() {
+			if wasSet {
+				os.Setenv(envKey, originalValue)
+			} else {
+				os.Unsetenv(envKey)
+			}
+		}()
+
+		// Set via environment variable
+		os.Setenv(envKey, "true")
+
+		cfg, err := config.LoadConfig(fakeDataDir, workingData)
+		require.NoError(t, err)
+		require.True(t, cfg.DeduplicateAzureVolumes, "deduplicateAzureVolumes should be true from env variable")
+	})
+}

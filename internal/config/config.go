@@ -162,6 +162,10 @@ type Kubelet struct {
 	// FilterConfigMapVolumes filters out configmap volumes from volume metrics.
 	// Requires cross-referencing with pod specs from /pods endpoint.
 	FilterConfigMapVolumes bool `mapstructure:"filterConfigMapVolumes"`
+	// DeduplicateAzureVolumes reports Azure volume metrics only once per unique
+	// Azure File share or Azure Disk, even if mounted by multiple pods.
+	// This prevents duplicate metrics for shared volumes like logs or config.
+	DeduplicateAzureVolumes bool `mapstructure:"deduplicateAzureVolumes"`
 }
 
 // ControlPlane contains config options for the control plane scraper.
@@ -308,6 +312,7 @@ func LoadConfig(filePath string, fileName string) (*Config, error) {
 	v.SetDefault("kubelet|retries", DefaultRetries)
 	v.SetDefault("kubelet|scraperMaxReruns", DefaultScraperMaxReruns)
 	v.SetDefault("kubelet|fetchPodsFromKubeService", false)
+	v.SetDefault("kubelet|deduplicateAzureVolumes", false)
 
 	v.SetDefault("controlPlane|timeout", DefaultTimeout)
 	v.SetDefault("controlPlane|retries", DefaultRetries)

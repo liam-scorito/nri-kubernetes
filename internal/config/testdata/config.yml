@@ -14,6 +14,7 @@ kubelet:
   networkRouteFile: /path/to/file
   scheme: http
   retries: 3
+  deduplicateAzureVolumes: true
 
 ksm:
   staticURL: http://test.com:8080

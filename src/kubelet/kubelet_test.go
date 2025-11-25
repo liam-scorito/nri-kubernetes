@@ -129,7 +129,7 @@ func TestScraper_FilterNamespace(t *testing.T) {
 		require.NoError(t, err)
 
 		// Call the asserter for the entities of this particular sub-test.
-		assert.Equal(t, 28, len(i.Entities))
+		assert.Equal(t, 23, len(i.Entities))
 	})
 }
 
